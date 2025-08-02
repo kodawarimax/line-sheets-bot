@@ -1,0 +1,15 @@
+# 秘密情報（絶対に公開しない）
+.env
+
+# Node.js関連
+node_modules/
+dist/
+*.log
+
+# OS関連
+.DS_Store
+Thumbs.db
+
+# エディタ関連
+.vscode/
+.idea/
