@@ -1,0 +1,236 @@
+// backend/src/services/core-processor.ts - 邨ｱ蜷亥・逅・お繝ｳ繧ｸ繝ｳ
+
+import { logger } from '../utils/logger';
+import { runQuery } from '../database/init';
+import { messageProcessor } from './processor';
+import { geminiService } from './gemini';
+import { google } from 'googleapis';
+
+// 識 繧ｷ繝ｳ繝励Ν險ｭ螳壼梛螳夂ｾｩ
+interface SimpleConfig {
+  lineChannelSecret: string;
+  lineAccessToken: string;
+  googleServiceAccountKey: string;
+  targetSheetId: string;
+  targetSheetName: string;
+  enableAI: boolean;
+}
+
+// 投 蜃ｦ逅・ｵ先棡蝙句ｮ夂ｾｩ
+interface ProcessingResult {
+  success: boolean;
+  messageId: number;
+  rowNumber?: number;
+  error?: string;
+  processingTime: number;
+}
+
+export class CoreProcessor {
+  private config: SimpleConfig | null = null;
+  private sheetsClient: any = null;
+
+  constructor() {
+    this.initializeConfig();
+  }
+
+  // 肌 險ｭ螳壼・譛溷喧
+  private async initializeConfig(): Promise<void> {
+    try {
+      // 迺ｰ蠅・､画焚縺ｾ縺溘・險ｭ螳壹ユ繝ｼ繝悶Ν縺九ｉ隱ｭ縺ｿ霎ｼ縺ｿ
+      this.config = {
+        lineChannelSecret: process.env.LINE_CHANNEL_SECRET || '',
+        lineAccessToken: process.env.LINE_ACCESS_TOKEN || '',
+        googleServiceAccountKey: process.env.GOOGLE_SERVICE_ACCOUNT_KEY || '',
+        targetSheetId: process.env.TARGET_SHEET_ID || '',
+        targetSheetName: process.env.TARGET_SHEET_NAME || '繝・・繧ｿ',
+        enableAI: process.env.ENABLE_AI === 'true'
+      };
+
+      // Google Sheets 繧ｯ繝ｩ繧､繧｢繝ｳ繝亥・譛溷喧
+      if (this.config.googleServiceAccountKey) {
+        const credentials = JSON.parse(this.config.googleServiceAccountKey);
+        const auth = new google.auth.GoogleAuth({
+          credentials,
+          scopes: ['https://www.googleapis.com/auth/spreadsheets']
+        });
+        this.sheetsClient = google.sheets({ version: 'v4', auth });
+      }
+
+      logger.info('笨・繧ｳ繧｢險ｭ螳壼・譛溷喧螳御ｺ・);
+    } catch (error) {
+      logger.error('笶・險ｭ螳壼・譛溷喧螟ｱ謨・', error);
+    }
+  }
+
+  // 噫 繝｡繧､繝ｳ蜃ｦ逅・ｼ哭INE竊担heets・医Ρ繝ｳ繧ｹ繝医ャ繝暦ｼ・  async processLINEMessage(messageText: string, senderId: string): Promise<ProcessingResult> {
+    const startTime = Date.now();
+    
+    try {
+      if (!this.config || !this.sheetsClient) {
+        throw new Error('繧ｷ繧ｹ繝・Β險ｭ螳壹′荳榊ｮ悟・縺ｧ縺・);
+      }
+
+      // 1. 繝｡繝・そ繝ｼ繧ｸ繧奪B縺ｫ菫晏ｭ・      const messageId = await this.saveMessage(messageText, senderId);
+
+      // 2. 繝・・繧ｿ謚ｽ蜃ｺ・磯ｫ倬溷・逅・ｼ・      const extractedData = messageProcessor.extractBasicData(messageText);
+
+      // 3. AI蛻・梵・医が繝励す繝ｧ繝ｳ・・      let analysis = null;
+      if (this.config.enableAI) {
+        try {
+          analysis = await geminiService.analyzeMessage(messageText);
+        } catch (aiError) {
+          logger.warn('AI蛻・梵繧ｹ繧ｭ繝・・:', aiError);
+        }
+      }
+
+      // 4. Sheets騾∽ｿ｡逕ｨ繝・・繧ｿ貅門ｙ
+      const sheetData = this.prepareSheetData(extractedData, analysis, messageText);
+
+      // 5. Google Sheets縺ｫ蜊ｳ蠎ｧ縺ｫ騾∽ｿ｡
+      const rowNumber = await this.sendToSheets(sheetData);
+
+      // 6. 邨先棡繧奪B縺ｫ險倬鹸
+      await this.updateMessageStatus(messageId, 'completed', { 
+        sheetRow: rowNumber,
+        extractedData,
+        analysis 
+      });
+
+      const result: ProcessingResult = {
+        success: true,
+        messageId,
+        rowNumber,
+        processingTime: Date.now() - startTime
+      };
+
+      logger.info(`笨・螳悟・蜃ｦ逅・・蜉・ ${result.processingTime}ms`, { messageId, rowNumber });
+      return result;
+
+    } catch (error) {
+      const result: ProcessingResult = {
+        success: false,
+        messageId: 0,
+        error: error instanceof Error ? error.message : String(error),
+        processingTime: Date.now() - startTime
+      };
+
+      logger.error('笶・蜃ｦ逅・､ｱ謨・', error);
+      return result;
+    }
+  }
+
+  // 沈 繝｡繝・そ繝ｼ繧ｸ菫晏ｭ・  private async saveMessage(content: string, senderId: string): Promise<number> {
+    await runQuery(`
+      INSERT INTO messages (content, sender_id, status, created_at)
+      VALUES (?, ?, 'processing', datetime('now'))
+    `, [content, senderId]);
+
+    const result = await runQuery('SELECT last_insert_rowid() as id');
+    return result[0].id;
+  }
+
+  // 投 Sheets騾∽ｿ｡繝・・繧ｿ貅門ｙ
+  private prepareSheetData(extractedData: any, analysis: any, originalText: string): any[] {
+    const now = new Date();
+    const timestamp = now.toISOString().replace('T', ' ').substring(0, 19);
+    
+    // 蝓ｺ譛ｬ蛻玲ｧ区・・医き繧ｹ繧ｿ繝槭う繧ｺ蜿ｯ閭ｽ・・    return [
+      timestamp,                                    // A蛻・ 蜿嶺ｿ｡譌･譎・      originalText,                                // B蛻・ 蜈・Γ繝・そ繝ｼ繧ｸ
+      extractedData.name || '',                    // C蛻・ 蜷榊燕
+      extractedData.email || '',                   // D蛻・ 繝｡繝ｼ繝ｫ
+      extractedData.phone || '',                   // E蛻・ 髮ｻ隧ｱ
+      extractedData.company || '',                 // F蛻・ 莨夂､ｾ蜷・      analysis?.sentiment || '',                   // G蛻・ 諢滓ュ
+      analysis?.urgency || '',                     // H蛻・ 邱頑･蠎ｦ
+      analysis?.category || '',                    // I蛻・ 繧ｫ繝・ざ繝ｪ
+      JSON.stringify(extractedData)                // J蛻・ 蜈ｨ繝・・繧ｿ・・SON・・    ];
+  }
+
+  // 豆 Google Sheets騾∽ｿ｡
+  private async sendToSheets(rowData: any[]): Promise<number> {
+    if (!this.config || !this.sheetsClient) {
+      throw new Error('Sheets險ｭ螳壹′荳榊ｮ悟・縺ｧ縺・);
+    }
+
+    // 谺｡縺ｮ遨ｺ陦後ｒ蜿門ｾ・    const response = await this.sheetsClient.spreadsheets.values.get({
+      spreadsheetId: this.config.targetSheetId,
+      range: `${this.config.targetSheetName}!A:A`
+    });
+
+    const nextRow = (response.data.values?.length || 1) + 1;
+
+    // 繝・・繧ｿ繧定ｿｽ蜉
+    await this.sheetsClient.spreadsheets.values.update({
+      spreadsheetId: this.config.targetSheetId,
+      range: `${this.config.targetSheetName}!A${nextRow}:J${nextRow}`,
+      valueInputOption: 'RAW',
+      resource: {
+        values: [rowData]
+      }
+    });
+
+    return nextRow;
+  }
+
+  // 統 繝｡繝・そ繝ｼ繧ｸ繧ｹ繝・・繧ｿ繧ｹ譖ｴ譁ｰ
+  private async updateMessageStatus(messageId: number, status: string, data: any): Promise<void> {
+    await runQuery(`
+      UPDATE messages 
+      SET 
+        status = ?,
+        extracted_data = ?,
+        ai_analysis = ?,
+        sheets_row_number = ?,
+        processed_at = datetime('now')
+      WHERE id = ?
+    `, [
+      status,
+      JSON.stringify(data.extractedData),
+      data.analysis ? JSON.stringify(data.analysis) : null,
+      data.sheetRow,
+      messageId
+    ]);
+  }
+
+  // 肌 險ｭ螳壽峩譁ｰ
+  async updateConfig(newConfig: Partial<SimpleConfig>): Promise<void> {
+    if (this.config) {
+      Object.assign(this.config, newConfig);
+      await this.initializeConfig();
+    }
+  }
+
+  // 唱 繝倥Ν繧ｹ繝√ぉ繝・け
+  async healthCheck(): Promise<{ status: string; details: any }> {
+    const checks = {
+      config: !!this.config,
+      sheets: !!this.sheetsClient,
+      database: false
+    };
+
+    try {
+      await runQuery('SELECT 1');
+      checks.database = true;
+    } catch (error) {
+      // DB謗･邯壼､ｱ謨・    }
+
+    // Sheets謗･邯壹ユ繧ｹ繝・    if (this.sheetsClient && this.config?.targetSheetId) {
+      try {
+        await this.sheetsClient.spreadsheets.get({
+          spreadsheetId: this.config.targetSheetId
+        });
+      } catch (error) {
+        checks.sheets = false;
+      }
+    }
+
+    const allHealthy = Object.values(checks).every(Boolean);
+    
+    return {
+      status: allHealthy ? 'healthy' : 'unhealthy',
+      details: checks
+    };
+  }
+}
+
+// 繧ｷ繝ｳ繧ｰ繝ｫ繝医Φ繧､繝ｳ繧ｹ繧ｿ繝ｳ繧ｹ
+export const coreProcessor = new CoreProcessor();

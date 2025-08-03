@@ -1,246 +1,180 @@
-// backend/src/services/core-processor.ts - 統合処理エンジン
+// backend/src/services/core_processor.ts - 修正版
 
 import { logger } from '../utils/logger';
 import { runQuery } from '../database/init';
-import { messageProcessor } from './processor';
-import { geminiService } from './gemini';
-import { google } from 'googleapis';
 
-// 🎯 シンプル設定型定義
-interface SimpleConfig {
-  lineChannelSecret: string;
-  lineAccessToken: string;
-  googleServiceAccountKey: string;
-  targetSheetId: string;
-  targetSheetName: string;
-  enableAI: boolean;
+export interface ProcessedData {
+  name?: string;
+  email?: string;
+  phone?: string;
+  company?: string;
+  message?: string;
+  urgency?: 'high' | 'medium' | 'low';
+  category?: string;
+  timestamp?: string;
 }
 
-// 📊 処理結果型定義
-interface ProcessingResult {
-  success: boolean;
-  messageId: number;
-  rowNumber?: number;
-  error?: string;
-  processingTime: number;
+interface ExtractionPatterns {
+  name: RegExp;
+  email: RegExp;
+  phone: RegExp;
+  company: RegExp;
 }
 
 export class CoreProcessor {
-  private config: SimpleConfig | null = null;
-  private sheetsClient: any = null;
-
-  constructor() {
-    this.initializeConfig();
-  }
-
-  // 🔧 設定初期化
-  private async initializeConfig(): Promise<void> {
+  
+  // メッセージからデータを抽出
+  async extractData(messageContent: string): Promise<ProcessedData> {
     try {
-      // 環境変数または設定テーブルから読み込み
-      this.config = {
-        lineChannelSecret: process.env.LINE_CHANNEL_SECRET || '',
-        lineAccessToken: process.env.LINE_ACCESS_TOKEN || '',
-        googleServiceAccountKey: process.env.GOOGLE_SERVICE_ACCOUNT_KEY || '',
-        targetSheetId: process.env.TARGET_SHEET_ID || '',
-        targetSheetName: process.env.TARGET_SHEET_NAME || 'データ',
-        enableAI: process.env.ENABLE_AI === 'true'
+      const extracted: ProcessedData = {};
+      
+      // 基本的なパターンマッチング
+      const patterns: ExtractionPatterns = {
+        name: /(?:名前|氏名)[：:\s]*([^\n\r]+)/i,
+        email: /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/,
+        phone: /(?:電話|TEL|Tel)[：:\s]*([0-9\-\s()]+)/i,
+        company: /(?:会社|企業)[：:\s]*([^\n\r]+)/i
       };
 
-      // Google Sheets クライアント初期化
-      if (this.config.googleServiceAccountKey) {
-        const credentials = JSON.parse(this.config.googleServiceAccountKey);
-        const auth = new google.auth.GoogleAuth({
-          credentials,
-          scopes: ['https://www.googleapis.com/auth/spreadsheets']
-        });
-        this.sheetsClient = google.sheets({ version: 'v4', auth });
-      }
-
-      logger.info('✅ コア設定初期化完了');
-    } catch (error) {
-      logger.error('❌ 設定初期化失敗:', error);
-    }
-  }
-
-  // 🚀 メイン処理：LINE→Sheets（ワンストップ）
-  async processLINEMessage(messageText: string, senderId: string): Promise<ProcessingResult> {
-    const startTime = Date.now();
-    
-    try {
-      if (!this.config || !this.sheetsClient) {
-        throw new Error('システム設定が不完全です');
-      }
-
-      // 1. メッセージをDBに保存
-      const messageId = await this.saveMessage(messageText, senderId);
-
-      // 2. データ抽出（高速処理）
-      const extractedData = messageProcessor.extractBasicData(messageText);
-
-      // 3. AI分析（オプション）
-      let analysis = null;
-      if (this.config.enableAI) {
-        try {
-          analysis = await geminiService.analyzeMessage(messageText);
-        } catch (aiError) {
-          logger.warn('AI分析スキップ:', aiError);
+      // 型安全な抽出
+      (Object.keys(patterns) as Array<keyof ExtractionPatterns>).forEach(key => {
+        const match = messageContent.match(patterns[key]);
+        if (match && match[1]) {
+          const value = match[1].trim();
+          extracted[key] = value;
         }
-      }
-
-      // 4. Sheets送信用データ準備
-      const sheetData = this.prepareSheetData(extractedData, analysis, messageText);
-
-      // 5. Google Sheetsに即座に送信
-      const rowNumber = await this.sendToSheets(sheetData);
-
-      // 6. 結果をDBに記録
-      await this.updateMessageStatus(messageId, 'completed', { 
-        sheetRow: rowNumber,
-        extractedData,
-        analysis 
       });
 
-      const result: ProcessingResult = {
-        success: true,
-        messageId,
-        rowNumber,
-        processingTime: Date.now() - startTime
-      };
+      // メッセージ全体を保存
+      extracted.message = messageContent;
+      extracted.timestamp = new Date().toISOString();
+      
+      // 緊急度の判定
+      const urgentKeywords = ['緊急', '至急', 'すぐに', '急いで'];
+      extracted.urgency = urgentKeywords.some(keyword => messageContent.includes(keyword)) ? 'high' : 'medium';
 
-      logger.info(`✅ 完全処理成功: ${result.processingTime}ms`, { messageId, rowNumber });
-      return result;
-
+      return extracted;
     } catch (error) {
-      const result: ProcessingResult = {
-        success: false,
-        messageId: 0,
-        error: error.message,
-        processingTime: Date.now() - startTime
+      logger.error('データ抽出エラー:', error);
+      return { 
+        message: messageContent, 
+        timestamp: new Date().toISOString(),
+        urgency: 'medium'
       };
-
-      logger.error('❌ 処理失敗:', error);
-      return result;
     }
   }
 
-  // 💾 メッセージ保存
-  private async saveMessage(content: string, senderId: string): Promise<number> {
-    await runQuery(`
-      INSERT INTO messages (content, sender_id, status, created_at)
-      VALUES (?, ?, 'processing', datetime('now'))
-    `, [content, senderId]);
+  // データベースに保存
+  async saveData(data: ProcessedData): Promise<number> {
+    try {
+      const result = await runQuery(`
+        INSERT INTO messages (
+          content, 
+          extracted_data, 
+          status, 
+          created_at
+        ) VALUES (?, ?, 'processed', datetime('now'))
+      `, [
+        data.message || '',
+        JSON.stringify(data)
+      ]);
 
-    const result = await runQuery('SELECT last_insert_rowid() as id');
-    return result[0].id;
+      // 挿入されたIDを取得
+      const lastIdResult = await runQuery('SELECT last_insert_rowid() as id');
+      const messageId = lastIdResult[0].id;
+
+      logger.info('データ保存完了', { messageId, data: data });
+      return messageId;
+
+    } catch (error) {
+      logger.error('データ保存エラー:', error);
+      throw error instanceof Error ? error : new Error('データ保存に失敗しました');
+    }
   }
 
-  // 📊 Sheets送信データ準備
-  private prepareSheetData(extractedData: any, analysis: any, originalText: string): any[] {
-    const now = new Date();
-    const timestamp = now.toISOString().replace('T', ' ').substring(0, 19);
-    
-    // 基本列構成（カスタマイズ可能）
+  // Google Sheetsに送信する形式に変換
+  formatForSheets(data: ProcessedData): string[] {
     return [
-      timestamp,                                    // A列: 受信日時
-      originalText,                                // B列: 元メッセージ
-      extractedData.name || '',                    // C列: 名前
-      extractedData.email || '',                   // D列: メール
-      extractedData.phone || '',                   // E列: 電話
-      extractedData.company || '',                 // F列: 会社名
-      analysis?.sentiment || '',                   // G列: 感情
-      analysis?.urgency || '',                     // H列: 緊急度
-      analysis?.category || '',                    // I列: カテゴリ
-      JSON.stringify(extractedData)                // J列: 全データ（JSON）
+      data.timestamp || '',
+      data.name || '',
+      data.email || '',
+      data.phone || '',
+      data.company || '',
+      data.urgency || 'medium',
+      data.category || '',
+      data.message || ''
     ];
   }
 
-  // 📤 Google Sheets送信
-  private async sendToSheets(rowData: any[]): Promise<number> {
-    if (!this.config || !this.sheetsClient) {
-      throw new Error('Sheets設定が不完全です');
-    }
-
-    // 次の空行を取得
-    const response = await this.sheetsClient.spreadsheets.values.get({
-      spreadsheetId: this.config.targetSheetId,
-      range: `${this.config.targetSheetName}!A:A`
-    });
-
-    const nextRow = (response.data.values?.length || 1) + 1;
-
-    // データを追加
-    await this.sheetsClient.spreadsheets.values.update({
-      spreadsheetId: this.config.targetSheetId,
-      range: `${this.config.targetSheetName}!A${nextRow}:J${nextRow}`,
-      valueInputOption: 'RAW',
-      resource: {
-        values: [rowData]
-      }
-    });
-
-    return nextRow;
-  }
-
-  // 📝 メッセージステータス更新
-  private async updateMessageStatus(messageId: number, status: string, data: any): Promise<void> {
-    await runQuery(`
-      UPDATE messages 
-      SET 
-        status = ?,
-        extracted_data = ?,
-        ai_analysis = ?,
-        sheets_row_number = ?,
-        processed_at = datetime('now')
-      WHERE id = ?
-    `, [
-      status,
-      JSON.stringify(data.extractedData),
-      data.analysis ? JSON.stringify(data.analysis) : null,
-      data.sheetRow,
-      messageId
-    ]);
-  }
-
-  // 🔧 設定更新
-  async updateConfig(newConfig: Partial<SimpleConfig>): Promise<void> {
-    if (this.config) {
-      Object.assign(this.config, newConfig);
-      await this.initializeConfig();
-    }
-  }
-
-  // 🏥 ヘルスチェック
-  async healthCheck(): Promise<{ status: string; details: any }> {
-    const checks = {
-      config: !!this.config,
-      sheets: !!this.sheetsClient,
-      database: false
-    };
-
+  // 統計情報の取得
+  async getStats(): Promise<any> {
     try {
-      await runQuery('SELECT 1');
-      checks.database = true;
+      const [totalResult] = await runQuery('SELECT COUNT(*) as total FROM messages');
+      
+      const [todayResult] = await runQuery(`
+        SELECT COUNT(*) as today 
+        FROM messages 
+        WHERE date(created_at) = date('now')
+      `);
+
+      const [urgencyResult] = await runQuery(`
+        SELECT 
+          JSON_EXTRACT(extracted_data, '$.urgency') as urgency,
+          COUNT(*) as count
+        FROM messages 
+        WHERE extracted_data IS NOT NULL
+        GROUP BY JSON_EXTRACT(extracted_data, '$.urgency')
+      `);
+
+      return {
+        total: totalResult.total,
+        today: todayResult.today,
+        urgencyDistribution: urgencyResult.reduce((acc: any, item: any) => {
+          if (item.urgency) acc[item.urgency] = item.count;
+          return acc;
+        }, {})
+      };
+
     } catch (error) {
-      // DB接続失敗
+      logger.error('統計取得エラー:', error);
+      return { 
+        total: 0, 
+        today: 0, 
+        urgencyDistribution: {} 
+      };
     }
+  }
 
-    // Sheets接続テスト
-    if (this.sheetsClient && this.config?.targetSheetId) {
-      try {
-        await this.sheetsClient.spreadsheets.get({
-          spreadsheetId: this.config.targetSheetId
-        });
-      } catch (error) {
-        checks.sheets = false;
-      }
+  // 完全処理フロー
+  async processMessage(messageContent: string): Promise<{
+    success: boolean;
+    messageId?: number;
+    data?: ProcessedData;
+    error?: string;
+  }> {
+    try {
+      // 1. データ抽出
+      const extractedData = await this.extractData(messageContent);
+      
+      // 2. データ保存
+      const messageId = await this.saveData(extractedData);
+      
+      logger.info('メッセージ処理完了', { messageId, success: true });
+      
+      return {
+        success: true,
+        messageId,
+        data: extractedData
+      };
+
+    } catch (error) {
+      logger.error('メッセージ処理エラー:', error);
+      
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
     }
-
-    const allHealthy = Object.values(checks).every(Boolean);
-    
-    return {
-      status: allHealthy ? 'healthy' : 'unhealthy',
-      details: checks
-    };
   }
 }
 
